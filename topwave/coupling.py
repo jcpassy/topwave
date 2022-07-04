@@ -56,8 +56,8 @@ class Coupling(object):
     DELTA : numpy.ndarray
         Distance between two sites (in the same unit cell) in fractional
         coordinates. 
-    JH : float
-        Heisenberg exchange of the coupling
+    strength : float
+        Exchange/Hopping strength of the coupling
     u : numpy.ndarray
         Three-dimensional vector related to the site1/site2 property 'Rot'
         that is used to construct the matrix elements in rotated local spin
@@ -66,6 +66,10 @@ class Coupling(object):
         Three-dimensional vector related to the site1/site2 property 'Rot'
         that is used to construct the matrix elements in rotated local spin
         reference frames.
+    label : str
+        Label that is used for the coupling part of the symbolic representation of the Hamiltonian.
+    label_DM : str
+        String that is used for the DM part of the symbolic representation of the Hamiltonian.
         
     Methods
     -------
@@ -73,10 +77,13 @@ class Coupling(object):
         Returns an empty dataframe with the right column labels for printing.
     get_df():
         Returns attributes of self as a pandas dataframe.
+    get_label(label=None, by_symmetry=True):
+        Generates labels for the symbolic representation of the Hamiltonian.
     get_uv():
         Constructs the u and v vectors when the system was magnetized.
-    get_matrix_elements(k):
+    get_sw_matrix_elements(k):
         Generates matrix elements of the coupling at a given k-point.
+
 
         
 
@@ -95,12 +102,57 @@ class Coupling(object):
         self.D = site1.distance(site2, R)
         self.R = R
         self.DELTA = site2.frac_coords - site1.frac_coords
-        self.JH = 0.
+        self.strength = 0.
         self.DM = np.array([0., 0., 0.], dtype=float)
-        self.u1, self.u2, self.v1, self.v2 = [None]*4
+        self.label = None
+        self.label_DM = None
+        try:
+            self.get_uv()
+        except KeyError:
+            self.u1, self.u2, self.v1, self.v2 = [None] * 4
         self.DF = pd.DataFrame([[self.SYMID, self.SYMOP.as_xyz_string(), self.DELTA, self.R, self.D, self.I,
-                                 str(self.SITE1.species), self.J, str(self.SITE2.species), self.JH, self.DM]],
-                               columns=['symid', 'symop', 'delta', 'R', 'dist', 'i', 'at1', 'j', 'at2', 'Heis.', 'DM'])
+                                 str(self.SITE1.species), self.J, str(self.SITE2.species), self.strength, self.DM]],
+                               columns=['symid', 'symop', 'delta', 'R', 'dist', 'i', 'at1', 'j', 'at2', 'strength', 'DM'])
+
+    def get_label(self, label=None, by_symmetry=True):
+        """ Generates a label to the coupling to represent Hamiltonian symbolically.
+
+        Parameters
+        ----------
+        label : str
+            Label that is assigned to the coupling. If None, a label is assigned based on the
+            (symmetry)-index of the coupling. Default is None.
+        by_symmetry : bool
+            If true the symmetry index will be used to assign a label. If false, the symmetry index
+            and the index will be used. Default is True.
+        """
+
+        if label is None and by_symmetry is True:
+            self.label = 'v_' + str(int(self.SYMID))
+        elif label is None and by_symmetry is False:
+            self.label = 'v_' + str(int(self.SYMID)) + str(int(self.ID))
+        else:
+            self.label = label
+
+    def get_label_DM(self, label=None, by_symmetry=True):
+        """ Generates labels for the DM interaction strengths.
+
+        label : str
+            Label that is assigned to the coupling. If None, a label is assigned based on the
+            (symmetry)-index of the coupling. Default is None.
+        by_symmetry : bool
+            If true the symmetry index will be used to assign a label. If false, the symmetry index
+            and the index will be used. Default is True.
+        """
+
+        if label is None and by_symmetry is True:
+            self.label_DM = 'D_' + str(int(self.SYMID))
+        elif label is None and by_symmetry is False:
+            self.label_DM = 'D_' + str(int(self.SYMID)) + str(int(self.ID))
+        else:
+            self.label_DM = label
+
+
 
     def get_uv(self):
         """ Constructs the u and v vector when the system was magnetized.
@@ -117,8 +169,35 @@ class Coupling(object):
 
         self.u1, self.u2, self.v1, self.v2 = u1, u2, v1, v2
 
-    def get_matrix_elements(self, k):
-        """ Constructs the matrix elements corresponding to the coupling.
+    def get_fourier_coefficients(self, k):
+        """
+        Given a k-point this returns the Fourier coefficients for this bond,
+        as well as the coefficients differentiated w.r.t. to all components of k.
+
+        Parameters
+        ----------
+        k : numpy.ndarray
+            Three-dimensional array corresponding to some k-point.
+        Returns
+        -------
+        c_k : complex
+            Fourier coefficient of the coupling at given k-point.
+        inner : numpy.ndarray
+            Derivatives of c_k w.r.t. to all components of the given k-point.
+        """
+
+        # two different choices of FT
+        # c_k = np.exp(-1j * ((self.DELTA + self.R) @ k) * 2 * np.pi)
+        c_k = np.exp(-1j * (self.R @ k) * 2 * np.pi)
+
+        # inner derivative w.r.t. to k
+        # inner = -1j * (self.DELTA + self.R) * 2 * np.pi
+        inner = -1j * self.R * 2 * np.pi
+
+        return c_k, inner
+
+    def get_sw_matrix_elements(self, k):
+        """ Constructs the matrix elements for the spin wave Hamiltonian.
         
         Parameters
         ----------
@@ -136,113 +215,46 @@ class Coupling(object):
         mu2 = norm(self.SITE2.properties['magmom'])
         c = np.sqrt(mu1 * mu2) / 2.
 
-        # two different choices of FT
-        #c_k = np.exp(-1j * ((self.DELTA + self.R) @ k) * 2 * np.pi)
-        c_k = np.exp(-1j * (self.R @ k) * 2 * np.pi)
-
-        # inner derivative w.r.t. to k
-        #inner = -1j * (self.DELTA + self.R) * 2 * np.pi
-        inner = -1j * self.R * 2 * np.pi
-
+        c_k, inner = self.get_fourier_coefficients(k)
 
         # constructs the exchange matrix
-        Jhat = np.array([[self.JH, self.DM[2], -self.DM[1]],
-                         [-self.DM[2], self.JH, self.DM[0]],
-                         [self.DM[1], -self.DM[0], self.JH]], dtype=complex)
+        Jhat = np.array([[self.strength, self.DM[2], -self.DM[1]],
+                         [-self.DM[2], self.strength, self.DM[0]],
+                         [self.DM[1], -self.DM[0], self.strength]], dtype=complex)
 
         # construct the matrix elements
+        # NOTE: Check redundancy for the a (and possibly b)-type matrix elements.
         A = c * c_k * (self.u1 @ Jhat @ np.conj(self.u2))
         Abar = c * np.conj(c_k) * (self.u1 @ Jhat @ np.conj(self.u2))
 
         CI = mu1 * (self.v1 @ Jhat @ self.v2)
         CJ = mu2 * (self.v1 @ Jhat @ self.v2)
 
-        # spurious
         B = c * c_k * (self.u1 @ Jhat @ self.u2)
         Bbar = c * np.conj(c_k) * np.conj(self.u2 @ Jhat @ self.u1)
 
         return A, Abar, CI, CJ, B, Bbar, inner
 
-    @staticmethod
-    def rotate_vector_to_ez(v):
-        """ Creates a 3x3 rotation matrix R with R v = [0, 0, 1]
-
-
-                Parameters
-                ----------
-                v : numpy.ndarray
-                    Three-dimensional vector.
-
-                Returns
-                -------
-                numpy.ndarray
-                    3x3 rotation matrix R with R v = [0, 0, 1].
-
-                """
-
-        v = np.array(v, dtype=float) / norm(v)
-        e3 = v
-        if np.isclose(np.abs(v), [1, 0, 0], atol=0.00001).all():
-            e2 = np.array([0, 0, 1])
-        else:
-            e2 = np.cross(v, [1, 0, 0])
-        e2 = e2 / norm(e2)
-        e1 = np.cross(e2, e3)
-
-        return np.array([e1, e2, e3]).T
-
-    @staticmethod
-    def align_unit_vectors(v1, v2=None):
-        """ Creates a 3x3 rotation matrix R with R v1 = v2
-
+    def get_tb_matrix_elements(self, k):
+        """ Constructs the matrix elements for the tight-binding Hamiltonian.
 
         Parameters
         ----------
-        v1 : numpy.ndarray
-            Three-dimensional vector.
-        v2 : numpy.ndarray
-            Three-dimensional vector. If None v2 = [0, 0, 1]. Default is None.
+        k : numpy.ndarray
+            Three-dimensional array corresponding to some k-point.
 
         Returns
         -------
-        numpy.ndarray
-            3x3 rotation matrix R with Rv1 = v2.
+        Matrix elements.
 
         """
 
-        v1 = np.array(v1, dtype=float)
-        if v2 is None:
-            v2 = np.array([0, 0, 1], dtype=float)
-        else:
-            v2 = np.array(v2)
+        c_k, inner = self.get_fourier_coefficients(k)
 
-        # make them unit vectors
-        v1 = v1 / norm(v1)
-        v2 = v2 / norm(v2)
+        # construct the matrix elements
+        A = c_k * self.strength
 
-        # and calculate their dot product
-        dot = v1 @ v2
-
-        # check whether v1 and v2 are (anti-)parallel
-        if np.isclose(dot, 1., atol=0.00001):
-            return np.eye(3, dtype=float)
-
-        elif np.isclose(dot, -1., atol=0.00001):
-            # get the first non-zero element of v2
-            idx = np.argmin(v2 == 0)
-            # construct v_orth which is orthogonal to ez using the scalar product
-            v_orth = np.ones(3)
-            v_orth[idx] = -v2[np.delete(np.arange(3), idx)].sum()
-            v_orth = v_orth / norm(v_orth)
-            # calculate rotational matrix
-            return -np.eye(3) + 2 * np.outer(v_orth, v_orth)
-
-        else:
-            angle = np.arccos(v1 @ v2) / 2 / np.pi * 360
-            print(angle)
-            cross = np.cross(v1, v2)
-            skew_mat = np.array([[0., -cross[2], cross[1]], [cross[2], 0., -cross[0]], [-cross[1], cross[0], 0.]])
-            return np.eye(3) + skew_mat + matrix_power(skew_mat, 2) * (1 / (1 + dot))
+        return A, inner
 
     def __repr__(self):
         return repr(self.DF)

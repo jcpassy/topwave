@@ -5,15 +5,21 @@ Created on Wed Jan  5 14:07:56 2022
 
 @author: niclas
 """
+from itertools import product
+from pathlib import Path
 
 from topwave import solvers
 from topwave.coupling import Coupling
+from topwave.util import rotate_vector_to_ez
+
 import numpy as np
+from numpy.linalg import eigvals, multi_dot, eig, eigh
 import pandas as pd
-from tabulate import tabulate
+from pymatgen.io.cif import CifWriter
 from scipy.linalg import norm, block_diag
-from numpy.linalg import eigvals, multi_dot, eig
-from itertools import product
+import sympy as sp
+from tabulate import tabulate
+
 
 
 class Model(object):
@@ -37,7 +43,7 @@ class Model(object):
         Attributes of CPLS are stored here for printing and selecting.
     MF : numpy.ndarray
         This is variable holds the external magnetic field. It is set via
-        'external_field'. Default is [0, 0, 0].
+        'set_field'. Default is [0, 0, 0].
 
 
     Methods
@@ -47,18 +53,18 @@ class Model(object):
         generated and grouped by symmetry based on the provided sg.
     show_couplings():
         Prints the couplings.
-    assign_exchange(J, symid):
-        Assign Heisenberg Exchange terms to a collection of couplings based
+    set_coupling(J, symid):
+        Assign Heisenberg Exchange or hopping amplitude terms to a collection of couplings based
         on their symmetry index.
-    assign_DM(D, symid):
-        Assign anti-symmetric exchange to a selection of couplings based on
-        their symmetry index.
-    external_field(B):
+    set_field(B):
         Apply an external magnetic field that is stored in self.MF
-    magnetize(gs):
+    set_moments(gs):
         Provide a classical magnetic ground state.
-
-
+    show_moments():
+        Prints the magnetic moments.
+    write_cif():
+        A function that uses pymatgen functionality to save Model.STRUC
+        as a mcif file to be visualized in e.g. VESTA
 
     """
 
@@ -73,19 +79,31 @@ class Model(object):
         # and label the sites within struc by an index
         for _, site in enumerate(self.STRUC):
             site.properties['id'] = _
+            site.properties['onsite_energy_label'] = None
+            site.properties['onsite_energy'] = 0
 
         # count the number of magnetic sites and save
         self.N = len(self.STRUC)
 
-        # allocate a list for the couplings and an dataframe for easy access
-        self.CPLS = []
-        self.CPLS_as_df = pd.DataFrame(columns=['symid', 'symop', 'delta', 'R', 'dist', 'i',
-                                                'at1', 'j', 'at2', 'Heis.', 'DM'])
+        # allocate an empty list for the couplings and a dataframe (for easy access and printing)
+        self.CPLS = None
+        self.CPLS_as_df = None
+        self.reset_all_couplings()
 
         # put zero magnetic field
         self.MF = np.zeros(3, dtype=float)
 
-    def generate_couplings(self, maxdist, sg=None):
+    def reset_all_couplings(self):
+        """
+        Deletes all couplings from self.CPLS and self.CPLS_as_df and allocates the
+        name space to an empty list/df.
+
+        """
+        self.CPLS = []
+        self.CPLS_as_df = pd.DataFrame(columns=['symid', 'symop', 'delta', 'R', 'dist', 'i',
+                                                'at1', 'j', 'at2', 'strength', 'DM'])
+
+    def generate_couplings(self, maxdist, sg):
         """
         Generates couplings up to a distance maxdist and stores them
 
@@ -95,8 +113,7 @@ class Model(object):
         maxdist : float
             Distance (in Angstrom) up to which couplings are generated.
         sg : int, optional
-            International Space Group number. If None is provided, the
-            spacegroup of self.STRUC will be used. The default is None.
+            International Space Group number.
 
 
         """
@@ -104,7 +121,7 @@ class Model(object):
         cpls = self.STRUC.get_symmetric_neighbor_list(maxdist, sg=sg, unique=True)
 
         # save the generated couplings (overriding any old ones)
-        self.CPLS = []
+        self.reset_all_couplings()
         for cplid, (i, j, R, d, symid, symop) in enumerate(zip(*cpls)):
             site1 = self.STRUC[i]
             site2 = self.STRUC[j]
@@ -122,30 +139,148 @@ class Model(object):
         print(tabulate(self.CPLS_as_df, headers='keys', tablefmt='github',
                        showindex=True))
 
-    def assign_exchange(self, JH, symid):
+    def set_coupling(self, strength, index, by_symmetry=True, label=None):
         """
-        Assigns Heisenberg Exchange to a selection of couplings based on
-        their symmetry index.
+        Assigns Heisenberg interaction or hopping amplitude to a selection
+        of couplings based on their (symmetry) index.
 
 
         Parameters
         ----------
-        JH : float
-            Strength of the Heisenberg exchange.
-        symid : int
+        strength : float
+            Strength of the Exchange/Hopping.
+        index : int
             Integer that corresponds to the symmetry index of a selection of
-            couplings.
+            couplings, or to the index if by_symmetry = False.
+        by_symmetry : bool
+            If true, index corresponds to the symmetry index of a selection of couplings.
+            If false, it corresponds to the index.
+        label : str
+            Label for the exchange/hopping parameter that is used for the symbolic
+            representation of the Hamiltonian. If None, a label is generated based
+            on the index.
+
+        """
+
+        if by_symmetry:
+            indices = self.CPLS_as_df.index[self.CPLS_as_df['symid'] == index].tolist()
+        else:
+            indices = self.CPLS_as_df.index[self.CPLS_as_df.index == index].tolist()
+
+        for _ in indices:
+            self.CPLS[_].strength = strength
+            self.CPLS_as_df.loc[_, 'strength'] = strength
+            self.CPLS[_].get_label(label, by_symmetry)
+
+    def set_field(self, direction, magnitude):
+        """
+        Setter for self.MF an external magnetic field to the model. This will
+        be translated to a Zeeman term mu_B B dot S
+
+        Parameters
+        ----------
+        direction : list
+            Three-dimensional vector that gives direction of an external magnetic field.
+        magnitude : float
+            Strength of the external magnetic field.
+
+        """
+
+        field = np.real(magnitude) * np.array(direction, dtype=float) / norm(direction)
+        self.MF[0], self.MF[1], self.MF[2] = tuple(field.tolist())
+
+    def set_moments(self, directions, magnitudes):
+        """ Assigns a magnetic ground state to the model
+
+
+        Parameters
+        ----------
+        directions : list
+            List of lists (or numpy.ndarray) that contains a three-dimensional
+            spin vector for each magnetic site in the unit cell indicating the
+            direction of the spin on each site (given in units of the lattice vectors).
+            Each vector is normalized, so only the direction matters. The magnitude of
+            magnetic moment is indicated by the 'magnitudes' argument. The vector is given in
+            the units of the lattice vectors.
+        magnitudes : list
+            List of floats specifying the magnitude of magnetic moment of each site.
 
 
         """
 
-        indices = self.CPLS_as_df.index[self.CPLS_as_df['symid'] == symid].tolist()
+        directions = np.array(directions, dtype=float).reshape((self.N, 3))
+        magnitudes = np.array(magnitudes, dtype=float).reshape((self.N,))
+        for _, (direction, magnitude) in enumerate(zip(directions, magnitudes)):
+            # rotate into cartesian coordinates and normalize it
+            moment = self.STRUC.lattice.matrix.T @ direction
+            moment = moment / norm(moment)
 
-        for _ in indices:
-            self.CPLS[_].JH = JH
-            self.CPLS_as_df.loc[_, 'Heis.'] = JH
+            # calculate the rotation matrix that rotates the spin to the quantization axis
+            self.STRUC[_].properties['Rot'] = rotate_vector_to_ez(moment)
+            # stretch it to match the right magnetic moment and save it
+            self.STRUC[_].properties['magmom'] = moment * magnitude
 
-    def assign_DM(self, D, symid):
+        # extract the u- and v-vectors from the rotation matrix
+        for cpl in self.CPLS:
+            cpl.get_uv()
+
+    def show_moments(self):
+        """
+        Prints the magnetic moments
+
+        """
+
+        for _, site in enumerate(self.STRUC):
+            print(f'Magnetic Moment on Site{_}:\t{site.properties["magmom"]}')
+
+    def write_cif(self, path=None):
+        """
+        Function that writes the pymatgen structure to a mcif file for visualization in e.g. VESTA
+
+        Parameters
+        ----------
+        path : str
+            Absolute path to the directory where the mcif file should be saved, e.g.
+            '/home/user/material/material.mcif'
+        """
+
+        # get user's home directory
+        home = str(Path.home())
+        path = home + '/topwave_model.mcif' if path is None else path
+
+        CifWriter(self.STRUC, write_magmoms=True).write_file(path)
+
+    def get_set_couplings(self):
+        """ Function that returns list of couplings that have been set and assigned a label.
+
+        Returns
+        -------
+        set_couplings : list
+            Couplings from self.CPLS that have been set and assigned a label via
+            'set_coupling' or 'set_DM'.
+
+        """
+
+        set_couplings = []
+        for cpl in self.CPLS:
+            if cpl.label is not None or cpl.label_DM is not None:
+                set_couplings.append(cpl)
+
+        return set_couplings
+
+
+class SpinWaveModel(Model):
+    """
+    Class for a Spin Wave Model.
+
+    Methods
+    -------
+    set_DM(D, symid):
+        Assign anti-symmetric exchange to a selection of couplings based on
+        their symmetry index.
+    """
+
+    def set_DM(self, D, index, by_symmetry=True):
         """
         Assigns asymmetric exchange terms to a selection of couplings based
         on their symmetry. The vector that is passed is rotated according to
@@ -156,74 +291,120 @@ class Model(object):
         D : list
             Three-dimensional vector that gives the anti-symmetric part of
             the exchange.
-        symid : int
+        index : int
             Integer that corresponds to the symmetry index of a selection of
-            couplings.
+            couplings, or to the index if by_symmetry = False.
+        by_symmetry : bool
+            If true, index corresponds to the symmetry index of a selection of couplings.
+            If false, it corresponds to the index.
 
 
         """
+        # IDEA for the problem with implementation of future symbolic representation and labels
+        # there's a problem when DM is initialized first on a bond. Maybe just check when DM is
+        # set whether theres a J bond, and if not create one with 0 strength.
+        if by_symmetry:
+            indices = self.CPLS_as_df.index[self.CPLS_as_df['symid'] == index].tolist()
+        else:
+            indices = self.CPLS_as_df.index[self.CPLS_as_df.index == index].tolist()
 
         D = np.array(D, dtype=float)
-        indices = self.CPLS_as_df.index[self.CPLS_as_df['symid'] == symid].tolist()
         _ = indices[0]
+        self.CPLS[_].DM = D
         self.CPLS_as_df.loc[_, 'DM'][0] = D[0]
         self.CPLS_as_df.loc[_, 'DM'][1] = D[1]
         self.CPLS_as_df.loc[_, 'DM'][2] = D[2]
 
-        self.CPLS[indices[0]].DM = D
-        for _ in indices[1:]:
-            Drot = self.CPLS[_].SYMOP.apply_rotation_only(D)
-            self.CPLS[_].DM = Drot
-            self.CPLS_as_df.loc[_, 'DM'][0] = Drot[0]
-            self.CPLS_as_df.loc[_, 'DM'][1] = Drot[1]
-            self.CPLS_as_df.loc[_, 'DM'][2] = Drot[2]
-
-    def external_field(self, B):
-        """
-        Setter for self.MF an external magnetic field to the model.
-
-        Parameters
-        ----------
-        B : list
-            Three-dimensional vector that gives direction and strength of
-            an external magnetic field.
+        if by_symmetry:
+            for _ in indices[1:]:
+                Drot = self.CPLS[_].SYMOP.apply_rotation_only(D)
+                self.CPLS[_].DM = Drot
+                self.CPLS_as_df.loc[_, 'DM'][0] = Drot[0]
+                self.CPLS_as_df.loc[_, 'DM'][1] = Drot[1]
+                self.CPLS_as_df.loc[_, 'DM'][2] = Drot[2]
 
 
-        """
+class TightBindingModel(Model):
+    """
+    Class for a tight-binding model.
 
-        self.MF = np.array(B, dtype=float)
+    Methods
+    -------
+    set_onsite_energy(onsite_energy, site_index, label):
+        Adds onsite energy terms to the given sites.
+    get_symbolic_hamiltonian():
+        Returns a symbolic representation of the Hamiltonian
+    """
 
-    def magnetize(self, dirs, moments):
-        """ Assigns a magnetic ground state to the model
-
+    def set_onsite_energy(self, onsite_energy, site_index=None, label=None):
+        """ Adds onsite term to the specified diagonal matrix element of the Hamiltonian.
 
         Parameters
         ----------
-        dirs : list
-            List of lists (or numpy.ndarray) that contains a three-dimensional
-            spin vector for each magnetic site in the unit cell indicating the
-            direction of the spin on each site (given in units of the lattice vectors).
-            Each vector is normalized, so only the direction matters. The magnitude of
-            magnetic moment is indicated by the 'moments' argument.
-        moments : list
-            List of floats specifying the magnitude of magnetic moment of each site.
-
-
+        onsite_energy : float
+            Magnitude of the onsite term.
+        site_index : int
+            Site index (ordered as in self.STRUC) that the term will be added to.
+            If None, the term will be added to all sites. Default is None.
+        label : str
+            A label that is used for the symbolic representation of the Hamiltonian. If None,
+            an automatic label is generated. Default is None.
         """
-        dirs = np.array(dirs, dtype=float)
-        for _, (dir, mu) in enumerate(zip(dirs, moments)):
-            # rotate into cartesian coordinates and normalize it
-            S = self.STRUC.lattice.matrix.T @ dir
-            S = S / np.round(norm(S), 6)
 
-            # calculate the rotation matrix that rotates the spin to the quantization axis
-            self.STRUC[_].properties['Rot'] = Coupling.rotate_vector_to_ez(S)
-            # stretch it to match the right magnetic moment and save it
-            self.STRUC[_].properties['magmom'] = S * mu
+        if site_index is None:
+            site_indices = np.arange(self.N)
+            auto_label = 'E_0'
+        else:
+            site_indices = [site_index]
+            auto_label = f'E_{site_index}'
 
-        # extract the u- and v-vectors from the rotation matrix
-        for cpl in self.CPLS:
-            cpl.get_uv()
+        for _ in site_indices:
+            self.STRUC[_].properties['onsite_energy'] = onsite_energy
+            self.STRUC[_].properties['onsite_energy_label'] = label if label is not None else auto_label
+
+    def get_symbolic_hamiltonian(self):
+        """ Uses sympy to construct and return a symbolic representation of
+        the Hamiltonian.
+
+        Returns
+        -------
+        symbolic_hamiltonian : sympy.matrices.dense.Matrix
+            Symbolic Hamiltonian
+        """
+
+        symbolic_hamiltonian = sp.Matrix(np.zeros((self.N, self.N)))
+        kx, ky, kz = sp.symbols('k_x k_y k_z', real=True)
+        labels = []
+        symbols = []
+        for cpl in self.get_set_couplings():
+            if cpl.label in labels:
+                index = labels.index(cpl.label)
+                symbol = symbols[index]
+            else:
+                labels.append(cpl.label)
+                if np.imag(cpl.strength) == 0:
+                    symbol = sp.Symbol(cpl.label, real=True)
+                else:
+                    symbol = sp.Symbol(cpl.label)
+                symbols.append(symbol)
+            fourier_coefficient = sp.exp(-sp.I * (cpl.R[0] * kx + cpl.R[1] * ky + cpl.R[2] * kz))
+            symbolic_hamiltonian[cpl.I, cpl.J] += symbol * fourier_coefficient
+            symbolic_hamiltonian[cpl.J, cpl.I] += (symbol * fourier_coefficient).conjugate()
+
+        labels = [site.properties['onsite_energy_label'] for site in self.STRUC]
+        unique_labels = [None]
+        for _, label in enumerate(labels):
+            if label not in unique_labels:
+                unique_labels.append(label)
+                symbol = sp.Symbol(label, real=True)
+                symbols.append(symbol)
+                indices = [index for index in range(self.N) if labels[index] == label]
+                for index in indices:
+                    symbolic_hamiltonian[index, index] += symbol
+
+        symbols = [kx, ky, kz] + symbols
+        return sp.nsimplify(symbolic_hamiltonian), symbols
+
 
 class Spec(object):
     """
@@ -231,7 +412,7 @@ class Spec(object):
 
     Parameters
     ----------
-    model : topwave.Model
+    model : model.Model
         The model of which the Hamiltonian is built.
     ks : numpy.ndarray
         Array of three-dimensional vectors in k-space at which the
@@ -261,7 +442,7 @@ class Spec(object):
     Methods
     -------
     solve():
-        Diagonalizes the bosonic Hamiltonian.
+        Diagonalizes the Hamiltonian.
     """
 
     def __init__(self, model, ks):
@@ -279,21 +460,63 @@ class Spec(object):
         self.N = len(model.STRUC)
         self.NK = len(ks)
 
+        # NOTE: think about the real implementation. Maybe two child classes of spec?
+        if isinstance(model, TightBindingModel):
+            self.H = self.get_tb_hamiltonian(model, self.KS)
+            self.solve(eigh)
         # build Hamiltonian and diagonalize it
-        self.H = self.get_hamiltonian(model)
-        self.solve()
+        else:
+            self.H = self.get_sw_hamiltonian(model)
+            self.solve(solvers.colpa)
 
         # TODO: make switches for these so they aren't calculated all the time
         # compute the local spin-spin correlation functions
         #self.get_correlation_functions(model)
 
         # compute the tangent matrices of the hamiltonian and the Berry Curvature
-        self.DHDK = self.get_tangent_matrices(model)
+        #self.DHDK = self.get_tangent_matrices(model)
 
         # compute the Berry curvature
         # self.get_berry_curvature()
 
-    def get_hamiltonian(self, model):
+    @staticmethod
+    def get_tb_hamiltonian(model, ks):
+        """ Function that builds the Hamiltonian for a tight-binding model.
+
+        Parameters
+        ----------
+        model : topwave.model.Model
+            The spin wave model that is used to construct the Hamiltonian.
+        ks : numpy.ndarray
+            Array of three-dimensional vectors in k-space at which the
+            Hamiltonian is constructed.
+
+        Returns
+        -------
+        The Hamiltonian of the model at the provided k-points.
+
+        """
+
+        N = len(model.STRUC)
+        NK = len(ks)
+        MAT = np.zeros((NK, N, N), dtype=complex)
+
+        # construct matrix elements at each k-point
+        for _, k in enumerate(ks):
+            for cpl in model.get_set_couplings():
+                # get the matrix elements from the couplings
+                (A, inner) = cpl.get_tb_matrix_elements(k)
+
+                MAT[_, cpl.I, cpl.J] += A
+                MAT[_, cpl.J, cpl.I] += np.conj(A)
+
+        # add onsite energy terms
+        for _, site in enumerate(model.STRUC):
+            MAT[:, _, _] += site.properties['onsite_energy']
+
+        return MAT
+
+    def get_sw_hamiltonian(self, model):
         """
         Function that builds the Hamiltonian for the model at a set of
         given k-points.
@@ -302,7 +525,6 @@ class Spec(object):
         ----------
         model : topwave.model.Model
             The spin wave model that is used to construct the Hamiltonian.
-        dHdk : str
 
         Returns
         -------
@@ -314,9 +536,9 @@ class Spec(object):
 
         # construct matrix elements at each k-point
         for _, k in enumerate(self.KS):
-            for cpl in model.CPLS:
+            for cpl in model.get_set_couplings():
                 # get the matrix elements from the couplings
-                (A, Abar, CI, CJ, B12, B21, inner) = cpl.get_matrix_elements(k)
+                (A, Abar, CI, CJ, B12, B21, inner) = cpl.get_sw_matrix_elements(k)
 
                 MAT[_, cpl.I, cpl.J] += A
                 MAT[_, cpl.J, cpl.I] += np.conj(A)
@@ -360,7 +582,7 @@ class Spec(object):
         for _, k in enumerate(self.KS):
             for cpl in model.CPLS:
                 # get the matrix elements from the couplings
-                (A, Abar, CI, CJ, B12, B21, inner) = cpl.get_matrix_elements(k)
+                (A, Abar, CI, CJ, B12, B21, inner) = cpl.get_sw_matrix_elements(k)
 
                 DHDK[_, :, cpl.I, cpl.J] += A * inner
                 DHDK[_, :, cpl.J, cpl.I] += np.conj(A) * np.conj(inner)
@@ -499,10 +721,14 @@ class Spec(object):
         for _, (k, psi_k) in enumerate(zip(self.KS, self.psi)):
             self.SS[_] = self.get_spin_spin_expectation_val(model, k, psi_k)
 
-    def solve(self):
+    def solve(self, solver):
         """
-        Diagonalizes the bosonic Hamiltonian
+        Diagonalizes the bosonic Hamiltonian.
 
+        Parameters
+        ----------
+        solver : function
+            A function that takes a Hamiltonian, and returns its eigenvalues and vectors.
 
         Returns
         -------
@@ -517,7 +743,7 @@ class Spec(object):
         # diagonalize the Hamiltonian at each k-point
         for _, k in enumerate(self.KS):
             try:
-                E[_], psi[_] = solvers.colpa(self.H[_])
+                E[_], psi[_] = solver(self.H[_])
             except:
                 s = 'Hamiltonian is not positive-definite at k = (%.3f, %.3f' \
                     ', %.3f). Adding small epsilon and trying again.' % tuple(k)
@@ -526,7 +752,7 @@ class Spec(object):
                     epsilon = np.sort(np.real(eigvals(self.H[_]))) + 0.0000001
                     # epsilon = 0.1
                     H_shftd = self.H[_] + np.eye(self.H.shape[1]) * epsilon
-                    E[_], psi[_] = solvers.colpa(H_shftd)
+                    E[_], psi[_] = solver(H_shftd)
                 except:
                     s = 'Diagonalization failed! Check classical ground state' \
                         ' or try different method for approximate' \
